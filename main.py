@@ -327,7 +327,8 @@ def filter_shows(shows, theatre_filter, time_periods, date_codes,
         # Per-theatre screen rules
         if rules:
             name_lower = s.venue_name.lower()
-            screen_lower = (s.screen_attr or "").lower()
+            # Screen label plus format name (e.g. "HDR By Barco" is only in the format)
+            screen_lower = f"{s.screen_attr or ''} {s.fmt or ''}".lower()
             ok = False
             for venue_kw, screen_kws in rules:
                 if venue_kw in name_lower and (

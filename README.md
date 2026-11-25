@@ -34,7 +34,7 @@ Go to **Settings → Secrets and variables → Actions → Variables** and add:
 | `BMS_DATES` | Dates to monitor (YYYYMMDD, comma-separated). Leave empty to auto-detect from URL. | `20260318,20260319` |
 | `BMS_THEATRE` | Filter by theatre name (substring match, comma-separated) | `PVR,IMAX` |
 | `BMS_TIME` | Filter by time period (comma-separated) | `evening,night` |
-| `BMS_SCREEN_RULES` | Per-theatre screen filter: `theatre=screen1\|screen2; theatre2=screen`. A show is kept only if its theatre matches a rule and its screen label contains one of the words. | `prasads=pcx\|atmos; allu=atmos` |
+| `BMS_SCREEN_RULES` | Per-theatre screen filter: `theatre=screen1\|screen2; theatre2=screen`. A show is kept only if its theatre matches a rule and its screen label or format name contains one of the words. | `prasads=pcx\|hdr by barco; allu=dolby cinema` |
 | `BMS_ALL_FORMATS` | Also check every other language/format listing (3D, 4DX, IMAX, dubbed). Default `true`. | `true` |
 
 Optional secret `NTFY_TOPIC`: a hard-to-guess topic name. Install the [ntfy](https://ntfy.sh) app, subscribe to the same topic, and you get a push notification for every alert (no account needed).
