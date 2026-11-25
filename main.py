@@ -11,6 +11,7 @@ import re
 import sys
 import json
 import time
+import random
 from html import escape
 from datetime import datetime
 from dataclasses import dataclass, field
@@ -651,11 +652,16 @@ def main():
 
     def get(ev, dc):
         nonlocal failed
-        d = fetch_bms(ev, dc, region_code, region_slug_r, lat, lon, geohash)
+        d = None
+        for attempt in range(4):
+            d = fetch_bms(ev, dc, region_code, region_slug_r, lat, lon, geohash)
+            if d is not None:
+                break
+            time.sleep(3 * (attempt + 1) + random.random() * 2)
         if d is None:
             failed = True
             print(f"  ⚠️  Request failed for {ev} {dc or '(default)'}")
-        time.sleep(0.4)
+        time.sleep(1.5 + random.random())
         return d
 
     failed = False
