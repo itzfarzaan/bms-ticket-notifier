@@ -10,6 +10,7 @@ import os
 import re
 import sys
 import json
+import time
 from html import escape
 from datetime import datetime
 from dataclasses import dataclass, field
@@ -27,11 +28,20 @@ CONFIG = {
     "dates": os.getenv("BMS_DATES", ""),          # comma-separated YYYYMMDD, empty = from URL
     "theatre": os.getenv("BMS_THEATRE", ""),       # substring filter, empty = all
     "time_period": os.getenv("BMS_TIME", ""),      # e.g. "evening,night", empty = all
+    # Per-theatre screen rules: "theatre=screen1|screen2; theatre2=screen".
+    # A show is kept only if its theatre matches a rule AND its screen
+    # label contains one of that rule's screen words. Empty = no rule filter.
+    "screen_rules": os.getenv("BMS_SCREEN_RULES", ""),
+    # Also check every other language/format listing of the movie
+    # (3D, 4DX, IMAX, dubbed versions...). Each one is a separate BMS event.
+    "all_formats": os.getenv("BMS_ALL_FORMATS", "true").strip().lower() not in ("0", "false", "no"),
 }
 
 RESEND_API_KEY = os.getenv("RESEND_API_KEY", "")
 RESEND_TO_EMAIL = os.getenv("RESEND_TO_EMAIL", "")
 RESEND_FROM_EMAIL = os.getenv("RESEND_FROM_EMAIL", "aviiciii@resend.dev")
+
+NTFY_TOPIC = os.getenv("NTFY_TOPIC", "")        # push alerts via ntfy.sh (no account needed)
 
 STATE_FILE = "bms_state.json"
 
@@ -91,6 +101,7 @@ class ShowInfo:
     time_code: str
     screen_attr: str
     categories: list[CatInfo] = field(default_factory=list)
+    fmt: str = ""
 
 @dataclass
 class DateInfo:
@@ -216,6 +227,35 @@ def parse_dates(data):
     return dates
 
 
+def parse_formats(data):
+    """All language/format variants of the movie: [(event_code, label)]."""
+    out = []
+    bs = data.get("data", {}).get("bottomSheetData", {})
+    for w in bs.get("format-selector", {}).get("widgets", []):
+        if w.get("type") != "chip-list":
+            continue
+        lang = w.get("text", "")
+        for chip in w.get("data", []):
+            ad = chip.get("cta", {}).get("additionalData", {})
+            code = ad.get("eventCode")
+            if code:
+                out.append((code, f"{lang} {chip.get('title', '')}".strip()))
+    return out
+
+
+def parse_rules(text):
+    rules = []
+    for part in re.split(r"[;\n]", text or ""):
+        if "=" not in part:
+            continue
+        venue, screens = part.split("=", 1)
+        venue = venue.strip().lower()
+        kws = [k.strip().lower() for k in screens.split("|") if k.strip()]
+        if venue:
+            rules.append((venue, kws))
+    return rules
+
+
 def parse_shows(data):
     shows = []
     for w in data.get("data", {}).get("showtimeWidgets", []):
@@ -266,8 +306,10 @@ def parse_shows(data):
 # ──────────────────────────────────────────────────────────────────────
 # FILTERING
 # ──────────────────────────────────────────────────────────────────────
-def filter_shows(shows, theatre_filter, time_periods, date_codes):
+def filter_shows(shows, theatre_filter, time_periods, date_codes,
+                 screen_rules=""):
     result = []
+    rules = parse_rules(screen_rules)
     kws = [k.strip().lower() for k in theatre_filter.split(",")
            if k.strip()] if theatre_filter else []
     periods = [p.strip().lower() for p in time_periods.split(",")
@@ -280,6 +322,20 @@ def filter_shows(shows, theatre_filter, time_periods, date_codes):
         if kws:
             name_lower = s.venue_name.lower()
             if not any(k in name_lower for k in kws):
+                continue
+
+        # Per-theatre screen rules
+        if rules:
+            name_lower = s.venue_name.lower()
+            screen_lower = (s.screen_attr or "").lower()
+            ok = False
+            for venue_kw, screen_kws in rules:
+                if venue_kw in name_lower and (
+                        not screen_kws
+                        or any(k in screen_lower for k in screen_kws)):
+                    ok = True
+                    break
+            if not ok:
                 continue
 
         # Date filter
@@ -326,16 +382,16 @@ def build_state(shows, dates):
     """Build a comparable state dict."""
     show_state = {}
     for s in shows:
-        for c in s.categories:
-            key = f"{s.venue_code}|{s.session_id}|{s.date_code}|{c.name}"
-            show_state[key] = {
-                "venue": s.venue_name,
-                "time": s.time,
-                "date": s.date_code,
-                "cat": c.name,
-                "price": c.price,
-                "status": c.status,
-            }
+        key = f"{s.venue_code}|{s.session_id}|{s.date_code}"
+        show_state[key] = {
+            "venue": s.venue_name,
+            "time": s.time,
+            "date": s.date_code,
+            "screen": s.screen_attr,
+            "fmt": s.fmt,
+            "cats": {c.name: {"price": c.price, "status": c.status}
+                     for c in s.categories},
+        }
 
     date_state = {
         d.date_code: d.status for d in dates
@@ -344,40 +400,51 @@ def build_state(shows, dates):
     return {"shows": show_state, "dates": date_state}
 
 
+def fmt_date(dc):
+    try:
+        return datetime.strptime(dc, "%Y%m%d").strftime("%a %d %b")
+    except (ValueError, TypeError):
+        return dc or "?"
+
+
+def describe(s):
+    screen = f" [{s['screen']}]" if s.get("screen") else ""
+    return f"{s['venue']} | {fmt_date(s['date'])} {s['time']}{screen}"
+
+
 def detect_changes(old_state, new_state):
     changes = []
-
-    # New dates opening
-    old_dates = old_state.get("dates", {})
-    new_dates = new_state.get("dates", {})
-    for dc, status in new_dates.items():
-        old_status = old_dates.get(dc)
-        if (old_status == "NOT_OPEN"
-                and status in ("BOOKABLE", "AVAILABLE")):
-            changes.append(f"📅 NEW DATE OPENED: {dc}")
-
     old_shows = old_state.get("shows", {})
     new_shows = new_state.get("shows", {})
 
-    # New showtimes
-    for key in set(new_shows) - set(old_shows):
+    # New showtimes at the watched screens
+    for key in sorted(set(new_shows) - set(old_shows),
+                      key=lambda k: (new_shows[k]["date"], new_shows[k]["venue"])):
         s = new_shows[key]
-        changes.append(
-            f"🆕 NEW: {s['venue']} {s['time']} [{s['date']}] "
-            f"— {s['cat']} ₹{s['price']}"
-        )
+        if "cats" not in s:          # state from an older version
+            continue
+        avail = [c for c, v in s["cats"].items() if v["status"] != "0"]
+        tag = "available: " + ", ".join(avail) if avail else "SOLD OUT"
+        changes.append(f"🆕 NEW SHOW: {describe(s)} ({tag})")
 
-    # Sold out → available
+    # Seat category: sold out → available again
     for key, new_s in new_shows.items():
         old_s = old_shows.get(key)
-        if old_s and old_s["status"] == "0" and new_s["status"] != "0":
-            lbl, ico = AVAIL_STATUS_MAP.get(
-                new_s["status"], ("UNKNOWN", "⚪")
-            )
-            changes.append(
-                f"{ico} BACK: {new_s['venue']} {new_s['time']} "
-                f"[{new_s['date']}] — {new_s['cat']} → {lbl}"
-            )
+        if not old_s or "cats" not in old_s or "cats" not in new_s:
+            continue
+        for cat, v in new_s["cats"].items():
+            ov = old_s["cats"].get(cat)
+            if ov and ov["status"] == "0" and v["status"] != "0":
+                lbl, ico = AVAIL_STATUS_MAP.get(v["status"], ("UNKNOWN", "⚪"))
+                changes.append(f"{ico} SEATS BACK: {describe(new_s)} — {cat} → {lbl}")
+
+    # Booking dates opening (only reported alongside show changes)
+    if changes:
+        old_dates = old_state.get("dates", {})
+        for dc, status in new_state.get("dates", {}).items():
+            if (old_dates.get(dc) == "NOT_OPEN"
+                    and status in ("BOOKABLE", "AVAILABLE")):
+                changes.append(f"📅 Booking opened for {fmt_date(dc)}")
 
     return changes
 
@@ -423,6 +490,7 @@ def send_email(subject, changes, shows, movie_info):
 
     shows_html = ""
     for vname, vshows in venue_groups.items():
+        vshows = sorted(vshows, key=lambda s: (s.date_code, s.time_code))
         show_rows = ""
         for s in vshows:
             cats = " | ".join(
@@ -430,11 +498,12 @@ def send_email(subject, changes, shows, movie_info):
                 for c in s.categories
             )
             fmt = f" [{escape(s.screen_attr)}]" if s.screen_attr else ""
+            fmt = f"{escape(fmt_date(s.date_code))} {escape(s.time)}{fmt}<br><span style=\"color:#888\">{escape(s.fmt)}</span>"
             show_rows += (
                 f'<tr>'
                 f'<td style="padding:5px 8px;border-bottom:1px solid #ddd;'
                 f'font-size:13px;vertical-align:top;">'
-                f'{escape(s.time)}{fmt}</td>'
+                f'{fmt}</td>'
                 f'<td style="padding:5px 8px;border-bottom:1px solid #ddd;'
                 f'font-size:13px;vertical-align:top;">'
                 f'{cats}</td>'
@@ -493,7 +562,7 @@ def send_email(subject, changes, shows, movie_info):
                 for c in s.categories
             )
             fmt = f" [{s.screen_attr}]" if s.screen_attr else ""
-            plain_lines.append(f"  {s.time}{fmt} - {cats}")
+            plain_lines.append(f"  {fmt_date(s.date_code)} {s.time}{fmt} ({s.fmt}) - {cats}")
     plain_lines.extend(["", "This is an automated alert from BMS Ticket Notifier."])
     plain = "\n".join(plain_lines)
 
@@ -521,6 +590,35 @@ def send_email(subject, changes, shows, movie_info):
         sys.exit(1)
 
 
+def send_ntfy(title, changes, shows):
+    """Push notification to the ntfy app (https://ntfy.sh)."""
+    topic = NTFY_TOPIC.strip()
+    if not topic:
+        return
+    lines = list(changes[:15])
+    if len(changes) > 15:
+        lines.append(f"...and {len(changes) - 15} more")
+    if not changes or changes[0].startswith("Now watching"):
+        for s in sorted(shows, key=lambda s: (s.date_code, s.venue_name, s.time_code))[:20]:
+            lines.append(f"- {s.venue_name.split(':')[0]} | "
+                         f"{fmt_date(s.date_code)} {s.time} [{s.screen_attr}]")
+    try:
+        r = requests.post(
+            f"https://ntfy.sh/{topic}",
+            data="\n".join(lines).encode("utf-8"),
+            headers={
+                "Title": title.encode("ascii", "ignore").decode(),
+                "Priority": "high",
+                "Tags": "movie_camera",
+                "Click": CONFIG["url"],
+            },
+            timeout=15,
+        )
+        print(f"  {'✅' if r.ok else '❌'} ntfy push: HTTP {r.status_code}")
+    except requests.RequestException as e:
+        print(f"  ❌ ntfy push failed: {e}")
+
+
 # ──────────────────────────────────────────────────────────────────────
 # MAIN
 # ──────────────────────────────────────────────────────────────────────
@@ -542,35 +640,71 @@ def main():
         region_slug
     )
 
-    # Determine dates to check
     raw_dates = CONFIG["dates"].strip()
-    if raw_dates:
-        date_list = [d.strip() for d in raw_dates.split(",") if d.strip()]
-    elif url_date:
-        date_list = [url_date]
-    else:
-        date_list = [""]
+    fixed_dates = [d.strip() for d in raw_dates.split(",") if d.strip()]
+    if not fixed_dates and url_date:
+        fixed_dates = [url_date]
 
     print(f"  Event: {event_code}  Region: {region_code}  "
-          f"Dates: {date_list}")
+          f"Dates: {fixed_dates or 'all open dates'}")
 
-    # Fetch data for each date
-    all_shows = []
-    all_dates = []
-    movie_info = {"name": "Unknown", "language": ""}
+    def get(ev, dc):
+        nonlocal failed
+        d = fetch_bms(ev, dc, region_code, region_slug_r, lat, lon, geohash)
+        if d is None:
+            failed = True
+            print(f"  ⚠️  Request failed for {ev} {dc or '(default)'}")
+        time.sleep(0.4)
+        return d
 
-    for dc in date_list:
-        data = fetch_bms(event_code, dc, region_code,
-                         region_slug_r, lat, lon, geohash)
-        if not data:
-            print(f"  ⚠️  No data for date {dc or '(default)'}")
+    failed = False
+    base = get(event_code, fixed_dates[0] if fixed_dates else "")
+    if not base:
+        print("  ❌ Could not reach BookMyShow. State left unchanged.")
+        sys.exit(0)
+
+    movie_info = parse_movie_info(base)
+    all_dates = parse_dates(base)
+
+    events = [(event_code, movie_info.get("language", "").replace("  •  ", " "))]
+    if CONFIG["all_formats"]:
+        for code, label in parse_formats(base):
+            if code == event_code:
+                events[0] = (code, label)
+            else:
+                events.append((code, label))
+    print(f"  Formats: {', '.join(l for _, l in events)}")
+
+    shows_by_key = {}
+    for ev, label in events:
+        first = base if ev == event_code else get(
+            ev, fixed_dates[0] if fixed_dates else "")
+        if not first:
             continue
+        if fixed_dates:
+            date_list = fixed_dates
+        else:
+            date_list = [d.date_code for d in parse_dates(first)
+                         if d.status in ("BOOKABLE", "AVAILABLE")]
+        first_shows = parse_shows(first)
+        first_dates = {sh.date_code for sh in first_shows}
+        batches = [first_shows]
+        for dc in date_list:
+            if dc in first_dates:
+                continue
+            d = get(ev, dc)
+            if d:
+                batches.append(parse_shows(d))
+        for batch in batches:
+            for sh in batch:
+                sh.fmt = label
+                shows_by_key[f"{sh.venue_code}|{sh.session_id}|{sh.date_code}"] = sh
 
-        if movie_info["name"] == "Unknown":
-            movie_info = parse_movie_info(data)
-
-        all_dates.extend(parse_dates(data))
-        all_shows.extend(parse_shows(data))
+    all_shows = list(shows_by_key.values())
+    if failed:
+        print("  ⚠️  Some requests failed — skipping change detection this run "
+              "to avoid false alerts.")
+        sys.exit(0)
 
     if not all_shows:
         print("  ❌ No showtimes found.")
@@ -584,6 +718,7 @@ def main():
         CONFIG["theatre"],
         CONFIG["time_period"],
         CONFIG["dates"],
+        CONFIG["screen_rules"],
     )
     print(f"  📊 {len(filtered)} showtime(s) after filters")
 
@@ -592,12 +727,20 @@ def main():
     old_state = load_state()
 
     changes = []
-    if old_state:
+    first_run = not old_state.get("shows") or any(
+        "cats" not in v for v in old_state.get("shows", {}).values())
+    if not first_run:
         changes = detect_changes(old_state, new_state)
 
     save_state(new_state)
 
-    if changes:
+    if first_run:
+        print("  ℹ️  First run — saving baseline and sending a summary.")
+        summary = [f"Now watching. {len(filtered)} matching show(s) open right now."]
+        send_email(f"BMS watch started: {movie_info['name']}",
+                   summary, filtered, movie_info)
+        send_ntfy(f"Watching {movie_info['name']}", summary, filtered)
+    elif changes:
         print(f"\n  ⚡ {len(changes)} change(s) detected:")
         for c in changes:
             print(f"     {c}")
@@ -605,6 +748,8 @@ def main():
             f"BMS Alert: {movie_info['name']} - {len(changes)} change(s)",
             changes, filtered, movie_info,
         )
+        send_ntfy(f"{movie_info['name']}: {len(changes)} change(s)",
+                  changes, filtered)
     else:
         print("  ✅ No changes since last check.")
 
@@ -616,7 +761,7 @@ def main():
             for c in s.categories
         )
         fmt = f"|{s.screen_attr}" if s.screen_attr else ""
-        print(f"    {s.venue_name} — {s.time}{fmt} [{s.date_code}] — {cats}")
+        print(f"    {s.venue_name} — {s.time}{fmt} [{s.date_code}] ({s.fmt}) — {cats}")
 
     print("\n  Done.")
 
